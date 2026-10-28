@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mr-john-auth"
-version = "1.0.0"
-description = "Official Python / FastAPI SDK for Mr. John Ecosystem Authentication & Authorization"
+version = "1.1.0"
+description = "Official Python / FastAPI SDK & API Client for Mr. John Ecosystem Authentication & Authorization"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
     { name = "Sho Shibata" }
 ]
-keywords = ["fastapi", "auth", "jwt", "jwks", "oauth2", "totp", "mfa"]
+keywords = ["fastapi", "auth", "jwt", "jwks", "oauth2", "totp", "mfa", "rbac", "permissions"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -46,4 +46,6 @@ mr_john_auth = ["py.typed"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["src"]
 testpaths = ["tests"]
+addopts = "--cov=mr_john_auth --cov-report=term-missing --cov-fail-under=95"

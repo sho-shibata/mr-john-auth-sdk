@@ -1,32 +1,35 @@
-"""Mr. John Authentication & Authorization SDK for Python / FastAPI."""
+"""Mr. John Auth Client SDK"""
 
-from mr_john_auth import auth_guard
 from mr_john_auth.auth_guard import (
-    AUTH_ISSUER,
-    AUTH_JWKS_URL,
-    PLAN_HIERARCHY,
-    SERVICE_CLIENT_ID,
     AsyncJWKSStore,
+    AuthClientData,
     AuthUser,
+    MrJohnAuthClient,
+    PLAN_HIERARCHY,
+    ServiceEntitlement,
+    ServicePermissionData,
     get_current_user,
+    get_optional_user,
     jwks_store,
+    require_global_admin,
     require_mfa,
     require_plan,
+    require_role,
 )
 
-__version__ = "1.0.0"
-
 __all__ = [
-    "AUTH_ISSUER",
-    "AUTH_JWKS_URL",
-    "PLAN_HIERARCHY",
-    "SERVICE_CLIENT_ID",
     "AsyncJWKSStore",
+    "AuthClientData",
     "AuthUser",
-    "auth_guard",
+    "MrJohnAuthClient",
+    "PLAN_HIERARCHY",
+    "ServiceEntitlement",
+    "ServicePermissionData",
     "get_current_user",
+    "get_optional_user",
     "jwks_store",
+    "require_global_admin",
     "require_mfa",
     "require_plan",
-    "__version__",
+    "require_role",
 ]
