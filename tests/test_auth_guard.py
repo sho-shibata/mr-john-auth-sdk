@@ -485,3 +485,90 @@ async def test_mr_john_auth_client_methods():
 
         rotated_c = await admin_sdk.rotate_client_secret("stock-research")
         assert rotated_c.client_secret == "mjc_new"
+
+        # 7. Test context manager (__aenter__ / __aexit__) and pre-supplied http_client
+        mock_get.return_value = r_single
+        async with MrJohnAuthClient(
+            api_base_url="https://auth-api.mr-john.dev",
+            client_id="stock-research",
+            client_secret="mjc_secret_123",
+        ) as pooled_client:
+            perm_pooled = await pooled_client.get_user_permission("user-001")
+            assert perm_pooled.plan_tier == "pro"
+            # Test json payload over persistent _http_client
+            mock_put.return_value = r_single
+            upserted_pooled = await pooled_client.upsert_user_permission("user-001", plan_tier="pro")
+            assert upserted_pooled.plan_tier == "pro"
+            # Entering again when _http_client is already set
+            async with pooled_client as same_client:
+                assert same_client is pooled_client
+
+        # Closing when already None is a safe no-op
+        await pooled_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sdk_configure_env_resolution_and_stale_while_revalidate(rsa_key_pair, monkeypatch):
+    """Verify programmatic configure(), dynamic env resolution, and Stale-While-Revalidate JWKS fallback."""
+    # 1. Test default fallback resolution when globals match defaults
+    monkeypatch.setenv("MR_JOHN_AUTH_API_URL", "https://env-api.mr-john.dev")
+    monkeypatch.setenv("MR_JOHN_AUTH_ISSUER", "https://env-issuer.mr-john.dev")
+    monkeypatch.setenv("MR_JOHN_CLIENT_ID", "env-client")
+    monkeypatch.setenv("MR_JOHN_CLIENT_SECRET", "env-secret")
+    monkeypatch.delenv("MR_JOHN_AUTH_JWKS_URL", raising=False)
+
+    auth_guard.AUTH_API_URL = auth_guard._DEFAULT_AUTH_API_URL
+    auth_guard.AUTH_JWKS_URL = f"{auth_guard._DEFAULT_AUTH_API_URL}/.well-known/jwks.json"
+    auth_guard.AUTH_ISSUER = auth_guard._DEFAULT_AUTH_ISSUER
+    auth_guard.SERVICE_CLIENT_ID = auth_guard._DEFAULT_CLIENT_ID
+    auth_guard.SERVICE_CLIENT_SECRET = ""
+
+    assert auth_guard._resolve_api_url() == "https://env-api.mr-john.dev"
+    assert auth_guard._resolve_jwks_url() == "https://env-api.mr-john.dev/.well-known/jwks.json"
+    assert auth_guard._resolve_issuer() == "https://env-issuer.mr-john.dev"
+    assert auth_guard._resolve_client_id() == "env-client"
+    assert auth_guard._resolve_client_secret() == "env-secret"
+
+    monkeypatch.setenv("MR_JOHN_AUTH_JWKS_URL", "https://env-jwks.mr-john.dev/jwks.json")
+    assert auth_guard._resolve_jwks_url() == "https://env-jwks.mr-john.dev/jwks.json"
+
+    # 2. Test programmatic configure()
+    auth_guard.configure(
+        client_id="configured-service",
+        client_secret="mjc_cfg_secret",
+        api_url="https://custom-auth.mr-john.dev",
+        issuer="https://custom-portal.mr-john.dev",
+    )
+    assert auth_guard._resolve_client_id() == "configured-service"
+    assert auth_guard._resolve_client_secret() == "mjc_cfg_secret"
+    assert auth_guard._resolve_api_url() == "https://custom-auth.mr-john.dev"
+    assert auth_guard._resolve_jwks_url() == "https://custom-auth.mr-john.dev/.well-known/jwks.json"
+    assert auth_guard._resolve_issuer() == "https://custom-portal.mr-john.dev"
+
+    auth_guard.configure(jwks_url="https://custom-jwks.mr-john.dev/keys.json")
+    assert auth_guard._resolve_jwks_url() == "https://custom-jwks.mr-john.dev/keys.json"
+
+    # 3. Test Stale-While-Revalidate on AsyncJWKSStore
+    store = AsyncJWKSStore(cache_ttl=10, min_refetch_cooldown=0)
+    kid = rsa_key_pair["kid"]
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"keys": [rsa_key_pair["jwk"]]}
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_get.return_value = mock_resp
+        key1 = await store.get_signing_key(kid)
+        assert key1 is not None
+
+        # Expire cache TTL and simulate network failure -> should serve stale key
+        store._last_fetched_at -= 20
+        mock_get.side_effect = Exception("Temporary DNS error")
+        key_stale = await store.get_signing_key(kid)
+        assert key_stale == key1
+
+        # Clear cache -> network failure now raises InvalidKeyError
+        store.clear()
+        with pytest.raises(jwt.InvalidKeyError, match="Failed to fetch JWKS"):
+            await store.get_signing_key(kid)
+

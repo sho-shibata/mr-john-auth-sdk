@@ -8,6 +8,7 @@ from mr_john_auth.auth_guard import (
     PLAN_HIERARCHY,
     ServiceEntitlement,
     ServicePermissionData,
+    configure,
     get_current_user,
     get_optional_user,
     jwks_store,
@@ -17,6 +18,8 @@ from mr_john_auth.auth_guard import (
     require_role,
 )
 
+__version__ = "1.2.0"
+
 __all__ = [
     "AsyncJWKSStore",
     "AuthClientData",
@@ -25,6 +28,8 @@ __all__ = [
     "PLAN_HIERARCHY",
     "ServiceEntitlement",
     "ServicePermissionData",
+    "__version__",
+    "configure",
     "get_current_user",
     "get_optional_user",
     "jwks_store",
