@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mr-john-auth"
-version = "1.1.0"
+version = "1.2.0"
 description = "Official Python / FastAPI SDK & API Client for Mr. John Ecosystem Authentication & Authorization"
 readme = "README.md"
 requires-python = ">=3.10"
