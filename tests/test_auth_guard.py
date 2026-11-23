@@ -1,29 +1,40 @@
-"""Unit tests for mr_john_auth SDK (AsyncJWKSStore, AuthUser, auth_guard, MrJohnAuthClient).
+"""Comprehensive Unit Tests for Python SDK v2.0 (mr_john_auth).
 
 All external HTTP calls are strictly mocked.
 """
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import gc
+import importlib.util
 import json
+from pathlib import Path
+import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
-import jwt
-from jwt.algorithms import RSAAlgorithm
-from cryptography.hazmat.primitives.asymmetric import rsa
+
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
+import jwt
+from jwt.algorithms import RSAAlgorithm
 import pytest
 
+import mr_john_auth
 from mr_john_auth import (
+    PLAN_HIERARCHY,
     AsyncJWKSStore,
-    AuthClientData,
     AuthUser,
     MrJohnAuthClient,
     ServiceEntitlement,
-    ServicePermissionData,
     auth_guard,
+    configure,
     get_current_user,
     get_optional_user,
+    jwks_store,
+    require_claim,
     require_global_admin,
     require_mfa,
     require_plan,
@@ -54,71 +65,156 @@ def rsa_key_pair():
     return {
         "private_pem": pem_private,
         "jwk": jwk_dict,
+        "jwks": {"keys": [jwk_dict]},
         "kid": "test-key-01",
     }
 
 
+@pytest.fixture(autouse=True)
+def reset_sdk_globals():
+    """Snapshot and restore SDK global state so configure() calls never leak across tests."""
+    saved_api_url = auth_guard.AUTH_API_URL
+    saved_jwks_url = auth_guard.AUTH_JWKS_URL
+    saved_issuer = auth_guard.AUTH_ISSUER
+    saved_audience = auth_guard.AUTH_AUDIENCE
+    saved_client_id = auth_guard.SERVICE_CLIENT_ID
+    saved_client_secret = auth_guard.SERVICE_CLIENT_SECRET
+    saved_overrides = dict(auth_guard._configured_overrides)
+    saved_store_url = jwks_store.jwks_url
+
+    auth_guard.AUTH_API_URL = auth_guard._DEFAULT_AUTH_API_URL
+    auth_guard.AUTH_JWKS_URL = f"{auth_guard._DEFAULT_AUTH_API_URL}/.well-known/jwks.json"
+    auth_guard.AUTH_ISSUER = auth_guard._DEFAULT_AUTH_ISSUER
+    auth_guard.AUTH_AUDIENCE = auth_guard._DEFAULT_AUTH_AUDIENCE
+    auth_guard.SERVICE_CLIENT_ID = auth_guard._DEFAULT_CLIENT_ID
+    auth_guard.SERVICE_CLIENT_SECRET = ""
+    auth_guard._configured_overrides.clear()
+    jwks_store.jwks_url = None
+    jwks_store.clear()
+    try:
+        yield
+    finally:
+        auth_guard.AUTH_API_URL = saved_api_url
+        auth_guard.AUTH_JWKS_URL = saved_jwks_url
+        auth_guard.AUTH_ISSUER = saved_issuer
+        auth_guard.AUTH_AUDIENCE = saved_audience
+        auth_guard.SERVICE_CLIENT_ID = saved_client_id
+        auth_guard.SERVICE_CLIENT_SECRET = saved_client_secret
+        auth_guard._configured_overrides.clear()
+        auth_guard._configured_overrides.update(saved_overrides)
+        jwks_store.jwks_url = saved_store_url
+        jwks_store.clear()
+
+
+def _make_sdk_token(
+    rsa_key_pair: dict,
+    *,
+    sub: str = "u-1",
+    email: str = "sdk@example.com",
+    iss: str | None = None,
+    aud: str = "mr-john-auth",
+    global_role: str = "user",
+    mfa_verified: bool = False,
+    custom_claims: dict | None = None,
+    services: dict | None = None,
+    ttl: int = 900,
+    include_kid: bool = True,
+) -> str:
+    now = int(time.time())
+    payload = {
+        "iss": auth_guard._DEFAULT_AUTH_ISSUER if iss is None else iss,
+        "sub": sub,
+        "aud": aud,
+        "exp": now + ttl,
+        "iat": now,
+        "email": email,
+        "email_verified": True,
+        "name": "SDK User",
+        "picture": "https://example.com/p.png",
+        "global_role": global_role,
+        "mfa_verified": mfa_verified,
+        "amr": ["pwd", "totp"] if mfa_verified else ["pwd"],
+        "custom_claims": custom_claims or {},
+        "services": services or {},
+        "ver": 1,
+    }
+    headers = {"kid": rsa_key_pair["kid"]} if include_kid else None
+    return jwt.encode(
+        payload,
+        rsa_key_pair["private_pem"],
+        algorithm="RS256",
+        headers=headers,
+    )
+
+
+def _make_mock_http_client(
+    rsa_key_pair: dict,
+    *,
+    payload: dict | None = None,
+    delay: float = 0.0,
+    error: Exception | None = None,
+):
+    """Build a mocked async httpx client without making real network calls."""
+    requested_urls: list[str] = []
+    state: dict = {"payload": payload, "delay": delay, "error": error}
+
+    async def _fake_get(url: str):
+        requested_urls.append(url)
+        if state["delay"] > 0:
+            await asyncio.sleep(state["delay"])
+        if state["error"] is not None:
+            raise state["error"]
+        active_payload = state["payload"]
+        return MagicMock(
+            raise_for_status=lambda: None,
+            json=lambda: active_payload if active_payload is not None else rsa_key_pair["jwks"],
+        )
+
+    mock_http = AsyncMock()
+    mock_http.__aenter__.return_value = mock_http
+    mock_http.__aexit__.return_value = False
+    mock_http.get.side_effect = _fake_get
+    return mock_http, requested_urls, state
+
+
 @pytest.mark.asyncio
-async def test_jwks_store_fetch_and_cache(rsa_key_pair):
-    """Verify AsyncJWKSStore fetches keys and caches them until TTL."""
-    store = AsyncJWKSStore("https://auth.example.com/.well-known/jwks.json", cache_ttl=3600)
+async def test_jwks_store_caching_cooldown_and_stale_while_revalidate(rsa_key_pair):
+    """Verify AsyncJWKSStore caching, unknown-kid cooldown, and Stale-While-Revalidate."""
+    store = AsyncJWKSStore(
+        jwks_url="https://auth.api.mr-john-it.com/.well-known/jwks.json",
+        cache_ttl=3600,
+        min_refetch_cooldown=300,
+    )
+    mock_http, _, http_state = _make_mock_http_client(rsa_key_pair)
 
-    mock_resp = MagicMock()
-    mock_resp.json.return_value = {"keys": [rsa_key_pair["jwk"]]}
-    mock_resp.raise_for_status = MagicMock()
+    with patch("mr_john_auth.auth_guard.httpx.AsyncClient", return_value=mock_http):
+        key1 = await store.get_signing_key(rsa_key_pair["kid"])
+        key2 = await store.get_signing_key(rsa_key_pair["kid"])
+        assert key1 is key2
+        assert mock_http.get.call_count == 1
 
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
-        mock_get.return_value = mock_resp
+        # Unknown kid blocked during cooldown
+        with pytest.raises(jwt.InvalidKeyError, match="cooldown"):
+            await store.get_signing_key("unknown-kid")
+        assert mock_http.get.call_count == 1
 
-        # First call: network fetch
-        key = await store.get_signing_key(rsa_key_pair["kid"])
-        assert key is not None
-        assert mock_get.call_count == 1
+        # Expire cache TTL and simulate upstream error -> Stale-While-Revalidate serves cached key
+        store._last_fetched_at -= 4000
+        http_state["error"] = RuntimeError("transient network error")
+        stale_key = await store.get_signing_key(rsa_key_pair["kid"])
+        assert stale_key is key1
 
-        # Second call: cached, no network fetch
-        key_cached = await store.get_signing_key(rsa_key_pair["kid"])
-        assert key_cached == key
-        assert mock_get.call_count == 1
-
-
-@pytest.mark.asyncio
-async def test_jwks_store_unknown_kid_cooldown(rsa_key_pair):
-    """Verify unknown kid activates cooldown protection against cache-busting DoS."""
-    store = AsyncJWKSStore("https://auth.example.com/.well-known/jwks.json", min_refetch_cooldown=300)
-
-    mock_resp = MagicMock()
-    mock_resp.json.return_value = {"keys": [rsa_key_pair["jwk"]]}
-    mock_resp.raise_for_status = MagicMock()
-
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
-        mock_get.return_value = mock_resp
-
-        # Prime the cache with known key
-        await store.get_signing_key(rsa_key_pair["kid"])
-
-        # Immediate request with unknown key should trigger cooldown exception without fetching
-        with pytest.raises(jwt.InvalidKeyError, match="refetch cooldown active"):
-            await store.get_signing_key("attacker-random-kid")
-        assert mock_get.call_count == 1
-
-
-@pytest.mark.asyncio
-async def test_jwks_store_network_failure():
-    """Verify network failures during JWKS fetch raise InvalidKeyError with message."""
-    store = AsyncJWKSStore("https://auth.example.com/.well-known/jwks.json")
-
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
-        mock_get.side_effect = Exception("Connection timeout")
-
+        # Clear cache -> network failure now raises InvalidKeyError
+        store.clear()
         with pytest.raises(jwt.InvalidKeyError, match="Failed to fetch JWKS"):
-            await store.get_signing_key("any-kid")
+            await store.get_signing_key(rsa_key_pair["kid"])
 
 
 @pytest.mark.asyncio
 async def test_get_current_user_valid_token_and_helpers(rsa_key_pair):
     """Verify valid RS256 token is decoded and all AuthUser helper methods work."""
     client_id = "stock-research"
-    auth_guard.SERVICE_CLIENT_ID = client_id
+    configure(client_id=client_id)
 
     now = int(time.time())
     payload = {
@@ -129,6 +225,7 @@ async def test_get_current_user_valid_token_and_helpers(rsa_key_pair):
         "mfa_verified": True,
         "amr": ["pwd", "totp"],
         "ver": 1,
+        "custom_claims": {"beta": True, "tier_level": 2},
         "services": {
             client_id: {
                 "plan": "pro",
@@ -136,12 +233,17 @@ async def test_get_current_user_valid_token_and_helpers(rsa_key_pair):
                 "daily_quota": 500,
             }
         },
-        "iss": auth_guard.AUTH_ISSUER,
+        "iss": auth_guard._DEFAULT_AUTH_ISSUER,
         "aud": client_id,
         "iat": now,
         "exp": now + 3600,
     }
-    token = jwt.encode(payload, rsa_key_pair["private_pem"], algorithm="RS256", headers={"kid": rsa_key_pair["kid"]})
+    token = jwt.encode(
+        payload,
+        rsa_key_pair["private_pem"],
+        algorithm="RS256",
+        headers={"kid": rsa_key_pair["kid"]},
+    )
 
     mock_key = RSAAlgorithm.from_jwk(rsa_key_pair["jwk"])
     with patch.object(auth_guard.jwks_store, "get_signing_key", new_callable=AsyncMock) as mock_get_key:
@@ -156,6 +258,13 @@ async def test_get_current_user_valid_token_and_helpers(rsa_key_pair):
         assert user.display_name == "Jane Trader"
         assert user.mfa_verified is True
         assert user.is_global_admin is False
+        assert user.get_claim("beta") is True
+        assert user.get_claim("missing", "fallback") == "fallback"
+        assert user.has_claim("beta", True) is True
+        assert user.has_claim("beta", 1) is False  # Strict bool vs int
+        assert user.has_claim("tier_level", 2) is True
+        assert user.has_claim("tier_level", True) is False
+        assert user.has_claim("missing", True) is False
         assert user.get_service_plan(client_id) == "pro"
         assert user.get_service_roles(client_id) == ["analyst", "trader"]
         assert user.has_service_role("analyst", client_id) is True
@@ -187,319 +296,661 @@ async def test_get_current_user_valid_token_and_helpers(rsa_key_pair):
 
 
 @pytest.mark.asyncio
-async def test_get_current_user_missing_credentials():
-    """Verify missing credentials raise 401 Unauthorized."""
+async def test_get_current_user_error_cases(rsa_key_pair):
+    """Verify missing credentials, missing kid, expired token, and audience mismatch raise 401."""
+    # 1. Missing credentials
     with pytest.raises(HTTPException) as exc_info:
         await get_current_user(None)
     assert exc_info.value.status_code == 401
     assert "Authorization header missing" in exc_info.value.detail
 
-
-@pytest.mark.asyncio
-async def test_get_current_user_missing_kid(rsa_key_pair):
-    """Verify token missing kid in header raises 401 Unauthorized."""
-    now = int(time.time())
-    token = jwt.encode(
-        {"sub": "u1", "iss": auth_guard.AUTH_ISSUER, "aud": auth_guard.SERVICE_CLIENT_ID, "exp": now + 3600},
-        rsa_key_pair["private_pem"],
-        algorithm="RS256",
-    )
-    creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+    # 2. Missing kid in header
+    no_kid_token = _make_sdk_token(rsa_key_pair, include_kid=False)
+    creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=no_kid_token)
     with pytest.raises(HTTPException) as exc_info:
         await get_current_user(creds)
     assert exc_info.value.status_code == 401
 
-
-@pytest.mark.asyncio
-async def test_get_current_user_expired_token(rsa_key_pair):
-    """Verify expired token raises 401 Unauthorized with expired message."""
-    client_id = auth_guard.SERVICE_CLIENT_ID
-    past = int(time.time()) - 3600
-    payload = {
-        "sub": "user-uuid-123",
-        "email": "user@example.com",
-        "iss": auth_guard.AUTH_ISSUER,
-        "aud": client_id,
-        "iat": past - 100,
-        "exp": past,
-    }
-    token = jwt.encode(payload, rsa_key_pair["private_pem"], algorithm="RS256", headers={"kid": rsa_key_pair["kid"]})
-
     mock_key = RSAAlgorithm.from_jwk(rsa_key_pair["jwk"])
     with patch.object(auth_guard.jwks_store, "get_signing_key", new_callable=AsyncMock) as mock_get_key:
         mock_get_key.return_value = mock_key
 
-        creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        # 3. Expired token
+        expired_token = _make_sdk_token(rsa_key_pair, ttl=-3600)
+        expired_creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=expired_token)
         with pytest.raises(HTTPException) as exc_info:
-            await get_current_user(creds)
+            await get_current_user(expired_creds)
         assert exc_info.value.status_code == 401
         assert "expired" in exc_info.value.detail
 
-
-@pytest.mark.asyncio
-async def test_get_current_user_audience_mismatch(rsa_key_pair):
-    """Verify token for another service is rejected (Confused Deputy Attack prevention)."""
-    auth_guard.SERVICE_CLIENT_ID = "target-service"
-    now = int(time.time())
-    payload = {
-        "sub": "user-uuid-123",
-        "email": "user@example.com",
-        "iss": auth_guard.AUTH_ISSUER,
-        "aud": "attacker-wrong-service",
-        "iat": now,
-        "exp": now + 3600,
-    }
-    token = jwt.encode(payload, rsa_key_pair["private_pem"], algorithm="RS256", headers={"kid": rsa_key_pair["kid"]})
-
-    mock_key = RSAAlgorithm.from_jwk(rsa_key_pair["jwk"])
-    with patch.object(auth_guard.jwks_store, "get_signing_key", new_callable=AsyncMock) as mock_get_key:
-        mock_get_key.return_value = mock_key
-
-        creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        # 4. Audience mismatch
+        bad_aud_token = _make_sdk_token(rsa_key_pair, aud="attacker-wrong-service")
+        bad_aud_creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=bad_aud_token)
         with pytest.raises(HTTPException) as exc_info:
-            await get_current_user(creds)
+            await get_current_user(bad_aud_creds)
         assert exc_info.value.status_code == 401
         assert "Token verification failed" in exc_info.value.detail
 
 
 @pytest.mark.asyncio
-async def test_require_mfa_and_global_admin_dependencies():
-    """Verify require_mfa and require_global_admin dependencies."""
+async def test_require_mfa_global_admin_plan_and_role_dependencies():
+    """Verify require_mfa, require_global_admin, require_plan, and require_role dependencies."""
+    client_id = "stock-research"
     verified_user = AuthUser(id="u1", email="a@b.com", mfa_verified=True, global_role="user")
     unverified_user = AuthUser(id="u2", email="b@b.com", mfa_verified=False, global_role="user")
+    pro_user = AuthUser(
+        id="u3",
+        email="trader@b.com",
+        services={client_id: {"plan": "pro", "roles": ["trader", "analyst"]}},
+    )
     admin_user = AuthUser(id="admin1", email="admin@b.com", mfa_verified=False, global_role="admin")
 
+    # require_mfa
     assert await require_mfa(verified_user) == verified_user
     with pytest.raises(HTTPException) as exc_info:
         await require_mfa(unverified_user)
     assert exc_info.value.status_code == 403
     assert "Two-factor authentication" in exc_info.value.detail
 
+    # require_global_admin
     assert await require_global_admin(admin_user) == admin_user
     with pytest.raises(HTTPException) as exc_info:
         await require_global_admin(verified_user)
     assert exc_info.value.status_code == 403
     assert "Global administrator" in exc_info.value.detail
 
-
-@pytest.mark.asyncio
-async def test_jwks_store_double_checked_lock_hit(rsa_key_pair):
-    """Verify double-checked locking returns key if primed by concurrent task while awaiting lock."""
-    store = AsyncJWKSStore("https://auth.example.com/.well-known/jwks.json")
-    mock_key = RSAAlgorithm.from_jwk(rsa_key_pair["jwk"])
-
-    orig_acquire = store._lock.acquire
-
-    async def side_effect_acquire():
-        store._keys[rsa_key_pair["kid"]] = mock_key
-        store._last_fetched_at = time.monotonic()
-        return await orig_acquire()
-
-    with patch.object(store._lock, "acquire", side_effect=side_effect_acquire):
-        key = await store.get_signing_key(rsa_key_pair["kid"])
-        assert key == mock_key
-
-
-@pytest.mark.asyncio
-async def test_jwks_store_key_not_in_fresh_jwks(rsa_key_pair):
-    """Verify InvalidKeyError is raised if fresh JWKS response does not contain the requested kid."""
-    store = AsyncJWKSStore("https://auth.example.com/.well-known/jwks.json")
-
-    mock_resp = MagicMock()
-    mock_resp.json.return_value = {"keys": [rsa_key_pair["jwk"]]}
-    mock_resp.raise_for_status = MagicMock()
-
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
-        mock_get.return_value = mock_resp
-        with pytest.raises(jwt.InvalidKeyError, match="Key ID unlisted-key not found in JWKS"):
-            await store.get_signing_key("unlisted-key")
-
-
-@pytest.mark.asyncio
-async def test_require_plan_and_require_role():
-    """Verify require_plan and require_role check permissions and allow global_admin bypass."""
-    client_id = "stock-research"
-    pro_user = AuthUser(
-        id="u1",
-        email="trader@b.com",
-        services={client_id: {"plan": "pro", "roles": ["trader", "analyst"]}},
-    )
-    admin_user = AuthUser(id="admin1", email="admin@b.com", global_role="admin")
-
-    free_checker = require_plan("free", client_id)
-    starter_checker = require_plan("starter", client_id)
-    pro_checker = require_plan("pro", client_id)
-    enterprise_checker = require_plan("enterprise", client_id)
-
-    assert await free_checker(pro_user) == pro_user
-    assert await starter_checker(pro_user) == pro_user
-    assert await pro_checker(pro_user) == pro_user
-
+    # require_plan
+    assert await require_plan("free", client_id)(pro_user) == pro_user
+    assert await require_plan("starter", client_id)(pro_user) == pro_user
+    assert await require_plan("pro", client_id)(pro_user) == pro_user
     with pytest.raises(HTTPException) as exc_info:
-        await enterprise_checker(pro_user)
+        await require_plan("enterprise", client_id)(pro_user)
     assert exc_info.value.status_code == 403
     assert "requires at least 'enterprise' plan" in exc_info.value.detail
+    assert await require_plan("enterprise", client_id)(admin_user) == admin_user
 
-    # Global admin bypasses plan check
-    assert await enterprise_checker(admin_user) == admin_user
-
-    # require_role checks
-    role_single = require_role("trader", client_id)
-    role_multi = require_role(["editor", "analyst"], client_id)
-    role_missing = require_role("super_editor", client_id)
-
-    assert await role_single(pro_user) == pro_user
-    assert await role_multi(pro_user) == pro_user
+    # require_role
+    assert await require_role("trader", client_id)(pro_user) == pro_user
+    assert await require_role(["editor", "analyst"], client_id)(pro_user) == pro_user
     with pytest.raises(HTTPException) as exc_info:
-        await role_missing(pro_user)
+        await require_role("super_editor", client_id)(pro_user)
     assert exc_info.value.status_code == 403
-    assert await role_missing(admin_user) == admin_user
+    assert await require_role("super_editor", client_id)(admin_user) == admin_user
 
 
 @pytest.mark.asyncio
-async def test_mr_john_auth_client_methods():
-    """Test MrJohnAuthClient SDK methods with mocked httpx responses."""
-    sdk_client = MrJohnAuthClient(
-        api_base_url="https://auth-api.mr-john.dev",
+async def test_sdk_guards_multi_audience_custom_claims_and_backward_compat(rsa_key_pair):
+    """Verify v2.0.0 require_claim, multi-audience tolerance, and backward-compatible guards."""
+    assert mr_john_auth.__version__ == "2.0.0"
+    assert PLAN_HIERARCHY["max"] == 3
+    assert PLAN_HIERARCHY["enterprise"] == 4
+
+    configure(
+        audience="mr-john-auth",
         client_id="stock-research",
-        client_secret="mjc_secret_123",
+        api_url="https://auth.api.mr-john-it.com",
+        issuer=auth_guard._DEFAULT_AUTH_ISSUER,
     )
 
-    perm_payload = {
-        "id": "perm-1",
-        "user_id": "user-001",
-        "client_id": "stock-research",
-        "plan_tier": "pro",
-        "roles": ["trader"],
-        "custom_claims": {"beta": True},
-        "created_at": "2026-10-29T00:00:00Z",
-        "updated_at": "2026-10-29T00:00:00Z",
-    }
+    mock_http, _, _ = _make_mock_http_client(rsa_key_pair)
+    jwks_store.clear()
 
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
-         patch("httpx.AsyncClient.put", new_callable=AsyncMock) as mock_put, \
-         patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post, \
-         patch("httpx.AsyncClient.patch", new_callable=AsyncMock) as mock_patch, \
-         patch("httpx.AsyncClient.delete", new_callable=AsyncMock) as mock_delete:
+    def _creds(tok: str) -> HTTPAuthorizationCredentials:
+        return HTTPAuthorizationCredentials(scheme="Bearer", credentials=tok)
 
-        # 1. get_user_permission
-        r_single = MagicMock()
-        r_single.json.return_value = perm_payload
-        r_single.raise_for_status = MagicMock()
-        mock_get.return_value = r_single
+    with patch("mr_john_auth.auth_guard.httpx.AsyncClient", return_value=mock_http):
+        assert await get_optional_user(None) is None
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_user(None)
+        assert exc_info.value.status_code == 401
 
-        perm = await sdk_client.get_user_permission("user-001")
-        assert isinstance(perm, ServicePermissionData)
-        assert perm.plan_tier == "pro"
+        pro_checker = require_claim("pro", True)
+        legacy_plan_checker = require_plan("pro")
+        legacy_role_checker = require_role("editor")
 
-        # 2. list_user_permissions & get_my_permissions
-        r_list = MagicMock()
-        r_list.json.return_value = {"permissions": [perm_payload], "total": 1}
-        r_list.raise_for_status = MagicMock()
-        mock_get.return_value = r_list
+        # 1. Token with v2.0 audience ("mr-john-auth") + custom_claims (bool vs int test)
+        tok_int_1 = _make_sdk_token(rsa_key_pair, custom_claims={"pro": 1, "roles": ["editor"]})
+        user_int_1 = await get_current_user(_creds(tok_int_1))
+        with pytest.raises(HTTPException) as exc_info:
+            await pro_checker(user_int_1)
+        assert exc_info.value.status_code == 403  # 1 != True in strict claim check
 
-        perms = await sdk_client.list_user_permissions("user-001")
-        assert len(perms) == 1 and perms[0].client_id == "stock-research"
-
-        my_perms = await sdk_client.get_my_permissions("user_jwt_token")
-        assert len(my_perms) == 1
-
-        # 3. upsert_user_permission
-        mock_put.return_value = r_single
-        upserted = await sdk_client.upsert_user_permission(
-            user_id="user-001",
-            plan_tier="pro",
-            roles=["trader"],
-            custom_claims={"beta": True},
+        tok_pro = _make_sdk_token(
+            rsa_key_pair,
+            aud="mr-john-auth",
+            custom_claims={"pro": True, "plan": "pro", "roles": ["editor"]},
         )
-        assert upserted.plan_tier == "pro"
+        user_pro = await get_current_user(_creds(tok_pro))
+        assert user_pro.id == "u-1"
+        assert user_pro.get_claim("pro") is True
+        assert await pro_checker(user_pro) == user_pro
+        assert await legacy_plan_checker(user_pro) == user_pro
+        assert await legacy_role_checker(user_pro) == user_pro
+        with pytest.raises(HTTPException) as exc_info:
+            await require_mfa(user_pro)
+        assert exc_info.value.status_code == 403
+        with pytest.raises(HTTPException) as exc_info:
+            await require_global_admin(user_pro)
+        assert exc_info.value.status_code == 403
 
-        # 4. delete_user_permission
-        r_del = MagicMock()
-        r_del.json.return_value = {"message": "deleted"}
-        r_del.raise_for_status = MagicMock()
-        mock_delete.return_value = r_del
-        del_resp = await sdk_client.delete_user_permission("user-001")
-        assert del_resp["message"] == "deleted"
-
-        # 5. exchange_code_for_tokens & refresh_tokens & get_user_profile
-        r_tok = MagicMock()
-        r_tok.json.return_value = {"access_token": "at_123", "refresh_token": "rt_123", "expires_in": 300}
-        r_tok.raise_for_status = MagicMock()
-        mock_post.return_value = r_tok
-
-        tok_data = await sdk_client.exchange_code_for_tokens("code1", "verifier1", "https://cb")
-        assert tok_data["access_token"] == "at_123"
-
-        ref_data = await sdk_client.refresh_tokens("rt_123")
-        assert ref_data["refresh_token"] == "rt_123"
-
-        # Also test public client branch (no client_secret)
-        pub_client = MrJohnAuthClient(client_id="diagramonitor", client_secret="")
-        await pub_client.exchange_code_for_tokens("code1", "verifier1", "https://cb")
-        await pub_client.refresh_tokens("rt_123")
-
-        r_prof = MagicMock()
-        r_prof.json.return_value = {"id": "user-001", "email": "u@example.com"}
-        r_prof.raise_for_status = MagicMock()
-        mock_get.return_value = r_prof
-        prof = await sdk_client.get_user_profile("user_jwt")
-        assert prof["id"] == "user-001"
-
-        # 6. Admin Client operations (list_clients, create_client, update_client, rotate_client_secret)
-        admin_sdk = MrJohnAuthClient(admin_access_token="admin_jwt")
-        client_item = {
-            "client_id": "stock-research",
-            "client_name": "Stock Research",
-            "client_type": "confidential",
-            "redirect_uris": [],
-            "allowed_scopes": ["openid"],
-            "is_active": True,
-            "client_secret": "mjc_new",
-        }
-        r_clients = MagicMock()
-        r_clients.json.return_value = {"clients": [client_item], "total": 1}
-        r_clients.raise_for_status = MagicMock()
-        mock_get.return_value = r_clients
-        c_list = await admin_sdk.list_clients()
-        assert len(c_list) == 1 and isinstance(c_list[0], AuthClientData)
-
-        r_client_single = MagicMock()
-        r_client_single.json.return_value = client_item
-        r_client_single.raise_for_status = MagicMock()
-        mock_post.return_value = r_client_single
-        mock_patch.return_value = r_client_single
-
-        created_c = await admin_sdk.create_client("stock-research", "Stock Research", "confidential")
-        assert created_c.client_secret == "mjc_new"
-
-        updated_c = await admin_sdk.update_client(
-            "stock-research",
-            client_name="Updated",
-            client_type="confidential",
-            redirect_uris=["https://cb"],
-            allowed_scopes=["openid"],
-            is_active=True,
+        # 2. Multi-audience tolerance: legacy child client_id ("stock-research") also accepted
+        tok_legacy_aud = _make_sdk_token(
+            rsa_key_pair,
+            aud="stock-research",
+            global_role="admin",
+            mfa_verified=True,
+            services={"stock-research": {"plan": "enterprise", "roles": ["admin"]}},
         )
-        assert updated_c.client_id == "stock-research"
+        user_legacy_aud = await get_current_user(_creds(tok_legacy_aud))
+        assert await require_mfa(user_legacy_aud) == user_legacy_aud
+        assert await require_global_admin(user_legacy_aud) == user_legacy_aud
+        assert await pro_checker(user_legacy_aud) == user_legacy_aud  # Admin bypasses require_claim
 
-        rotated_c = await admin_sdk.rotate_client_secret("stock-research")
-        assert rotated_c.client_secret == "mjc_new"
+        # 3. Unknown audience rejected 401
+        tok_bad_aud = _make_sdk_token(rsa_key_pair, aud="other-app")
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_user(_creds(tok_bad_aud))
+        assert exc_info.value.status_code == 401
 
-        # 7. Test context manager (__aenter__ / __aexit__) and pre-supplied http_client
-        mock_get.return_value = r_single
-        async with MrJohnAuthClient(
-            api_base_url="https://auth-api.mr-john.dev",
+    with pytest.raises(ValueError, match="Unknown plan tier"):
+        AuthUser(id="u1", email="a@b.com").has_minimum_plan("platinum")
+
+
+@pytest.mark.asyncio
+async def test_sdk_default_issuer_and_rejects_old_or_invalid_issuer(
+    rsa_key_pair,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify SDK default issuer matches API URL and rejects stale UI-domain or unknown issuers."""
+    for env_key in (
+        "MR_JOHN_AUTH_ISSUER",
+        "MR_JOHN_AUTH_API_URL",
+        "MR_JOHN_AUTH_AUDIENCE",
+        "MR_JOHN_CLIENT_ID",
+    ):
+        monkeypatch.delenv(env_key, raising=False)
+
+    assert auth_guard._DEFAULT_AUTH_ISSUER == auth_guard._DEFAULT_AUTH_API_URL
+    assert auth_guard._DEFAULT_AUTH_ISSUER == "https://auth.api.mr-john-it.com"
+    assert auth_guard._resolve_issuer() == "https://auth.api.mr-john-it.com"
+
+    mock_http, _, _ = _make_mock_http_client(rsa_key_pair)
+
+    def _creds(tok: str) -> HTTPAuthorizationCredentials:
+        return HTTPAuthorizationCredentials(scheme="Bearer", credentials=tok)
+
+    default_issued_jwt = _make_sdk_token(
+        rsa_key_pair,
+        sub="user-default-iss",
+        email="default@example.com",
+        iss="https://auth.api.mr-john-it.com",
+    )
+    old_ui_issuer_jwt = _make_sdk_token(rsa_key_pair, sub="user-old-iss", iss="https://auth.mr-john-it.com")
+    evil_issuer_jwt = _make_sdk_token(rsa_key_pair, sub="user-evil-iss", iss="https://evil.example.com")
+
+    with patch("mr_john_auth.auth_guard.httpx.AsyncClient", return_value=mock_http):
+        # 1. Pure default state (no configure() call): default issuer succeeds, old/evil issuers fail with 401.
+        ok_user = await get_current_user(_creds(default_issued_jwt))
+        assert ok_user.id == "user-default-iss"
+        assert ok_user.email == "default@example.com"
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_user(_creds(old_ui_issuer_jwt))
+        assert exc_info.value.status_code == 401
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_user(_creds(evil_issuer_jwt))
+        assert exc_info.value.status_code == 401
+
+        assert await get_optional_user(_creds(old_ui_issuer_jwt)) is None
+
+        # 2. Calling configure() without issuer= preserves _DEFAULT_AUTH_ISSUER.
+        configure(
+            audience="mr-john-auth",
             client_id="stock-research",
-            client_secret="mjc_secret_123",
-        ) as pooled_client:
-            perm_pooled = await pooled_client.get_user_permission("user-001")
-            assert perm_pooled.plan_tier == "pro"
-            # Test json payload over persistent _http_client
-            mock_put.return_value = r_single
-            upserted_pooled = await pooled_client.upsert_user_permission("user-001", plan_tier="pro")
-            assert upserted_pooled.plan_tier == "pro"
-            # Entering again when _http_client is already set
+            api_url="https://auth.api.mr-john-it.com",
+        )
+        assert auth_guard._resolve_issuer() == "https://auth.api.mr-john-it.com"
+        ok_after_cfg = await get_current_user(_creds(default_issued_jwt))
+        assert ok_after_cfg.id == "user-default-iss"
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_user(_creds(old_ui_issuer_jwt))
+        assert exc_info.value.status_code == 401
+
+        # 3. Explicit configure(issuer=...) overrides default for migrating child services.
+        configure(issuer="https://legacy.mr-john-it.com")
+        legacy_jwt = _make_sdk_token(rsa_key_pair, sub="user-legacy", iss="https://legacy.mr-john-it.com")
+        legacy_user = await get_current_user(_creds(legacy_jwt))
+        assert legacy_user.id == "user-legacy"
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_user(_creds(default_issued_jwt))
+        assert exc_info.value.status_code == 401
+
+
+def test_jwks_store_multi_event_loop_concurrency_and_weakref_cleanup(rsa_key_pair):
+    """Verify AsyncJWKSStore safely serves multiple sequential and concurrent event loops without RuntimeError."""
+    store = AsyncJWKSStore(jwks_url="https://auth.api.mr-john-it.com/.well-known/jwks.json")
+    mock_http, _, _ = _make_mock_http_client(rsa_key_pair, delay=0.01)
+
+    with patch("mr_john_auth.auth_guard.httpx.AsyncClient", return_value=mock_http):
+        # 1. Sequential event loops (e.g. FastAPI TestClient / repeated asyncio.run) reuse store without error.
+        key_loop1 = asyncio.run(store.get_signing_key(rsa_key_pair["kid"]))
+        gc.collect()
+        assert len(store._locks) == 0
+
+        key_loop2 = asyncio.run(store.get_signing_key(rsa_key_pair["kid"]))
+        assert key_loop1 is key_loop2
+        assert mock_http.get.call_count == 1
+
+        # 2. Same-loop concurrent tasks deduplicate upstream HTTP fetch via per-loop asyncio.Lock.
+        store.clear()
+
+        async def _concurrent_same_loop():
+            return await asyncio.gather(
+                *[store.get_signing_key(rsa_key_pair["kid"]) for _ in range(5)]
+            )
+
+        keys = asyncio.run(_concurrent_same_loop())
+        assert len(keys) == 5
+        assert all(k is keys[0] for k in keys)
+        assert mock_http.get.call_count == 2
+
+        # 3. Concurrent independent event loops across worker threads never raise loop-binding RuntimeError.
+        store.clear()
+        barrier = threading.Barrier(2)
+
+        def _worker():
+            async def _run():
+                barrier.wait(timeout=5)
+                return await store.get_signing_key(rsa_key_pair["kid"])
+
+            return asyncio.run(_run())
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f1 = pool.submit(_worker)
+            f2 = pool.submit(_worker)
+            w_key1 = f1.result(timeout=5)
+            w_key2 = f2.result(timeout=5)
+
+        assert w_key1 is not None and w_key2 is not None
+
+        # 4. Fallback lock dictionary handles non-weakref custom loops, reuses open-loop lock, and prunes closed loops.
+        class _NonWeakrefLockMap:
+            def get(self, _key):
+                raise TypeError("cannot create weak reference to loop")
+
+        store.clear()
+        store._locks = _NonWeakrefLockMap()  # type: ignore[assignment]
+
+        async def _reuse_fallback_same_loop():
+            k_a = await store.get_signing_key(rsa_key_pair["kid"])
+            store.clear()
+            k_b = await store.get_signing_key(rsa_key_pair["kid"])
+            return k_a, k_b
+
+        k_a, k_b = asyncio.run(_reuse_fallback_same_loop())
+        assert k_a is not None and k_b is not None
+        assert len(store._fallback_locks) == 1
+
+        store.clear()
+        assert asyncio.run(store.get_signing_key(rsa_key_pair["kid"])) is not None
+        # Closed previous loop was pruned when inserting the new loop.
+        assert len(store._fallback_locks) == 1
+
+
+@pytest.mark.asyncio
+async def test_jwks_store_stale_if_error_backoff_startup_and_recovery(
+    rsa_key_pair,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify stale-if-error backoff prevents upstream hammering, fails fast on missing kids, and resets on recovery."""
+    clock = {"now": 5.0}  # Simulate container uptime < error_cooldown (30.0s) at startup
+    monkeypatch.setattr(auth_guard, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
+
+    store = AsyncJWKSStore(
+        jwks_url="https://auth.api.mr-john-it.com/.well-known/jwks.json",
+        cache_ttl=60,
+        min_refetch_cooldown=30,
+        error_cooldown=30.0,
+    )
+    mock_http, _, http_state = _make_mock_http_client(rsa_key_pair)
+
+    with patch("mr_john_auth.auth_guard.httpx.AsyncClient", return_value=mock_http):
+        # Startup with time.monotonic() < error_cooldown must NOT trigger false cooldown.
+        key1 = await store.get_signing_key(rsa_key_pair["kid"])
+        assert mock_http.get.call_count == 1
+        assert store._last_error_at is None
+
+        # Expire cache TTL and simulate upstream failure -> serves stale key and starts error_cooldown.
+        clock["now"] = 100.0
+        http_state["error"] = RuntimeError("upstream unavailable")
+        stale_key = await store.get_signing_key(rsa_key_pair["kid"])
+        assert stale_key is key1
+        assert mock_http.get.call_count == 2
+        assert store._last_error_at == 100.0
+        assert store._last_fetched_at == 5.0
+
+        # During error_cooldown (100.0 <= t < 130.0): cached kid returns immediately, missing kid fails fast.
+        clock["now"] = 115.0
+        assert await store.get_signing_key(rsa_key_pair["kid"]) is key1
+        with pytest.raises(jwt.InvalidKeyError, match="backoff"):
+            await store.get_signing_key("unknown-kid")
+        assert mock_http.get.call_count == 2
+
+        # At exact error_cooldown boundary (t == 130.0): retries upstream and clears error state on success.
+        clock["now"] = 130.0
+        http_state["error"] = None
+        refreshed_key = await store.get_signing_key(rsa_key_pair["kid"])
+        assert refreshed_key is not None
+        assert mock_http.get.call_count == 3
+        assert store._last_error_at is None
+        assert store._last_error_url is None
+
+        # Valid JWKS response that lacks requested kid raises InvalidKeyError without setting _last_error_at.
+        clock["now"] = 200.0
+        with pytest.raises(jwt.InvalidKeyError, match="not found in JWKS"):
+            await store.get_signing_key("absent-kid")
+        assert store._last_error_at is None
+
+    # Concurrent failure on empty store: second waiter sees error_cooldown and fails fast without 2nd HTTP call.
+    empty_store = AsyncJWKSStore(
+        jwks_url="https://auth.api.mr-john-it.com/.well-known/jwks.json",
+        error_cooldown=30.0,
+    )
+    failing_http, _, _ = _make_mock_http_client(rsa_key_pair, delay=0.02, error=RuntimeError("timeout"))
+    with patch("mr_john_auth.auth_guard.httpx.AsyncClient", return_value=failing_http):
+        results = await asyncio.gather(
+            empty_store.get_signing_key(rsa_key_pair["kid"]),
+            empty_store.get_signing_key(rsa_key_pair["kid"]),
+            return_exceptions=True,
+        )
+    assert all(isinstance(r, jwt.InvalidKeyError) for r in results)
+    assert failing_http.get.call_count == 1
+
+    # Switching JWKS URL clears previous URL error state instead of leaking backoff across URLs.
+    empty_store.jwks_url = "https://other.example.com/.well-known/jwks.json"
+    assert empty_store.has_url_mismatch("https://other.example.com/.well-known/jwks.json") is True
+    recovery_http, _, _ = _make_mock_http_client(rsa_key_pair)
+    with patch("mr_john_auth.auth_guard.httpx.AsyncClient", return_value=recovery_http):
+        assert await empty_store.get_signing_key(rsa_key_pair["kid"]) is not None
+    assert empty_store._last_error_at is None
+    assert empty_store._last_error_url is None
+
+
+@pytest.mark.asyncio
+async def test_jwks_store_non_destructive_parsing_and_malformed_jwks(
+    rsa_key_pair,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Verify empty/corrupted JWKS payloads preserve cached keys and skip invalid JWK items safely."""
+    clock = {"now": 100.0}
+    monkeypatch.setattr(auth_guard, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
+
+    store = AsyncJWKSStore(
+        jwks_url="https://auth.api.mr-john-it.com/.well-known/jwks.json",
+        cache_ttl=60,
+        min_refetch_cooldown=30,
+        error_cooldown=30.0,
+    )
+    valid_payload = rsa_key_pair["jwks"]
+    valid_jwk = rsa_key_pair["jwk"]
+
+    payload_holder = {"data": valid_payload}
+    mock_http = AsyncMock()
+    mock_http.__aenter__.return_value = mock_http
+    mock_http.__aexit__.return_value = False
+    mock_http.get.return_value = MagicMock(
+        raise_for_status=lambda: None,
+        json=lambda: payload_holder["data"],
+    )
+
+    with patch("mr_john_auth.auth_guard.httpx.AsyncClient", return_value=mock_http):
+        initial_key = await store.get_signing_key(rsa_key_pair["kid"])
+
+        # 1. Empty {"keys": []} after TTL expiry must NOT overwrite existing cached keys.
+        clock["now"] = 200.0
+        payload_holder["data"] = {"keys": []}
+        assert await store.get_signing_key(rsa_key_pair["kid"]) is initial_key
+        assert rsa_key_pair["kid"] in store._keys
+        assert store._last_error_at == 200.0
+
+        # 2. All-unusable entries (non-dict, EC, use="enc", non-string kid, bad RSA key) keep stale cache intact.
+        clock["now"] = 240.0
+        payload_holder["data"] = {
+            "keys": [
+                "not-a-dict",
+                {"kty": "EC", "kid": "ec-1"},
+                {**valid_jwk, "use": "enc", "kid": "enc-only"},
+                {**valid_jwk, "kid": 12345},
+                {**valid_jwk, "kid": ""},
+                {"kty": "RSA", "use": "sig", "kid": "broken-rsa", "n": "!!!", "e": "AQAB"},
+            ]
+        }
+        with caplog.at_level("WARNING", logger="mr_john_auth"):
+            assert await store.get_signing_key(rsa_key_pair["kid"]) is initial_key
+        assert rsa_key_pair["kid"] in store._keys
+        assert store._last_error_at == 240.0
+        assert "Skipping" in caplog.text
+
+        # 3. Mixed valid + invalid JWK items: invalid items skipped, valid RSA signing key (even use=None) kept.
+        clock["now"] = 280.0
+        valid_no_use_jwk = {k: v for k, v in valid_jwk.items() if k != "use"}
+        payload_holder["data"] = {
+            "keys": [
+                "bad-entry",
+                {**valid_jwk, "use": "enc", "kid": "enc-key"},
+                {**valid_jwk, "kid": 999},
+                valid_no_use_jwk,
+            ]
+        }
+        refreshed = await store.get_signing_key(rsa_key_pair["kid"])
+        assert refreshed is not None
+        assert store._last_error_at is None
+        assert list(store._keys.keys()) == [rsa_key_pair["kid"]]
+
+
+@pytest.mark.asyncio
+async def test_configure_initial_cache_clear_dynamic_env_and_generation_guard(
+    rsa_key_pair,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify configure() cache clearing, env tracking precedence, _IMPORT_DEFAULTS, and generation guard."""
+    mock_http, requested_urls, _ = _make_mock_http_client(rsa_key_pair)
+
+    with patch("mr_john_auth.auth_guard.httpx.AsyncClient", return_value=mock_http):
+        # 1. First configure(api_url=...) clears keys previously fetched from the default URL.
+        await jwks_store.get_signing_key(rsa_key_pair["kid"])
+        assert requested_urls == ["https://auth.api.mr-john-it.com/.well-known/jwks.json"]
+        assert rsa_key_pair["kid"] in jwks_store._keys
+
+        configure(api_url="https://tenant2.example.com")
+        assert jwks_store._keys == {}
+        assert jwks_store._cached_url is None
+
+        await jwks_store.get_signing_key(rsa_key_pair["kid"])
+        assert requested_urls[-1] == "https://tenant2.example.com/.well-known/jwks.json"
+
+        # Explicit jwks_url + client_secret override works and clears previous cache.
+        configure(
+            jwks_url="https://explicit-jwks.example.com/keys.json",
+            client_secret="configured-secret",
+        )
+        assert auth_guard._resolve_jwks_url() == "https://explicit-jwks.example.com/keys.json"
+        assert auth_guard._resolve_client_secret() == "configured-secret"
+        assert jwks_store._keys == {}
+
+    # 2. configure(audience=...) leaves jwks_store.jwks_url=None so later env var changes still apply.
+    auth_guard._configured_overrides.clear()
+    auth_guard.AUTH_API_URL = auth_guard._DEFAULT_AUTH_API_URL
+    auth_guard.AUTH_JWKS_URL = auth_guard._DEFAULT_AUTH_JWKS_URL
+    auth_guard.SERVICE_CLIENT_SECRET = ""
+    jwks_store.jwks_url = None
+    jwks_store.clear()
+
+    mock_http2, requested_urls2, _ = _make_mock_http_client(rsa_key_pair)
+    with patch("mr_john_auth.auth_guard.httpx.AsyncClient", return_value=mock_http2):
+        configure(audience="my-child-service")
+        assert jwks_store.jwks_url is None
+
+        await jwks_store.get_signing_key(rsa_key_pair["kid"])
+        assert requested_urls2 == ["https://auth.api.mr-john-it.com/.well-known/jwks.json"]
+
+        monkeypatch.setenv("MR_JOHN_AUTH_JWKS_URL", "https://dynamic-env.example.com/.well-known/jwks.json")
+        assert auth_guard._resolve_jwks_url() == "https://dynamic-env.example.com/.well-known/jwks.json"
+
+        await jwks_store.get_signing_key(rsa_key_pair["kid"])
+        assert requested_urls2[-1] == "https://dynamic-env.example.com/.well-known/jwks.json"
+
+        # Switching env again before configure(client_id=...) triggers clear via has_url_mismatch().
+        monkeypatch.setenv("MR_JOHN_AUTH_JWKS_URL", "https://third-env.example.com/.well-known/jwks.json")
+        configure(client_id="child-client-id")
+        assert jwks_store._keys == {}
+        assert jwks_store._cached_url is None
+
+    # 3. Non-default env at import time (_IMPORT_DEFAULTS) still allows later setenv/delenv and configure() overrides.
+    monkeypatch.setenv("MR_JOHN_AUTH_API_URL", "https://boot-env.example.com/")
+    monkeypatch.setenv("MR_JOHN_AUTH_ISSUER", "https://boot-iss.example.com")
+    monkeypatch.setenv("MR_JOHN_AUTH_AUDIENCE", "boot-aud")
+    monkeypatch.setenv("MR_JOHN_CLIENT_ID", "boot-cid")
+    monkeypatch.setenv("MR_JOHN_CLIENT_SECRET", "boot-secret")
+    monkeypatch.delenv("MR_JOHN_AUTH_JWKS_URL", raising=False)
+
+    spec = importlib.util.spec_from_file_location("_test_isolated_auth_guard", Path(auth_guard.__file__))
+    assert spec is not None and spec.loader is not None
+    isolated_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolated_mod)
+
+    assert isolated_mod._resolve_api_url() == "https://boot-env.example.com"
+    assert isolated_mod._resolve_jwks_url() == "https://boot-env.example.com/.well-known/jwks.json"
+    assert isolated_mod._resolve_issuer() == "https://boot-iss.example.com"
+    assert isolated_mod._resolve_audience() == "boot-aud"
+    assert isolated_mod._resolve_client_id() == "boot-cid"
+    assert isolated_mod._resolve_client_secret() == "boot-secret"
+
+    monkeypatch.setenv("MR_JOHN_AUTH_API_URL", "https://reloaded-env.example.com")
+    assert isolated_mod._resolve_api_url() == "https://reloaded-env.example.com"
+    assert isolated_mod._resolve_jwks_url() == "https://reloaded-env.example.com/.well-known/jwks.json"
+
+    monkeypatch.delenv("MR_JOHN_AUTH_API_URL")
+    assert isolated_mod._resolve_api_url() == isolated_mod._DEFAULT_AUTH_API_URL
+    assert isolated_mod._resolve_jwks_url() == isolated_mod._DEFAULT_AUTH_JWKS_URL
+
+    # Direct module global assignment overrides env (Priority 2 > Priority 3).
+    isolated_mod.AUTH_ISSUER = "https://manual-global.example.com"
+    assert isolated_mod._resolve_issuer() == "https://manual-global.example.com"
+
+    # Explicit configure() resetting to default overrides env (Priority 1 > Priority 3).
+    monkeypatch.setenv("MR_JOHN_AUTH_API_URL", "https://env-should-be-overridden.example.com")
+    isolated_mod.configure(api_url=isolated_mod._DEFAULT_AUTH_API_URL)
+    assert isolated_mod._resolve_api_url() == isolated_mod._DEFAULT_AUTH_API_URL
+
+    # 4. In-flight generation guard discards stale results/errors if clear() or configure() happens mid-fetch.
+    gen_store = AsyncJWKSStore(jwks_url="https://url-a.example.com/.well-known/jwks.json")
+    started_evt = asyncio.Event()
+    release_evt = asyncio.Event()
+    should_fail = {"value": False}
+
+    async def _gated_get(_url: str):
+        started_evt.set()
+        await release_evt.wait()
+        if should_fail["value"]:
+            raise RuntimeError("stale generation failure")
+        return MagicMock(raise_for_status=lambda: None, json=lambda: rsa_key_pair["jwks"])
+
+    gated_http = AsyncMock()
+    gated_http.__aenter__.return_value = gated_http
+    gated_http.__aexit__.return_value = False
+    gated_http.get.side_effect = _gated_get
+
+    with patch("mr_john_auth.auth_guard.httpx.AsyncClient", return_value=gated_http):
+        # 4a. In-flight fetch succeeds after clear() -> rejected and does not pollute store.
+        task = asyncio.create_task(gen_store.get_signing_key(rsa_key_pair["kid"]))
+        await started_evt.wait()
+        gen_store.clear()
+        release_evt.set()
+        with pytest.raises(jwt.InvalidKeyError, match="changed"):
+            await task
+        assert gen_store._keys == {}
+        assert gen_store._cached_url is None
+
+        # 4b. In-flight fetch fails after clear() -> rejected and does not poison _last_error_at.
+        started_evt.clear()
+        release_evt.clear()
+        should_fail["value"] = True
+        task_err = asyncio.create_task(gen_store.get_signing_key(rsa_key_pair["kid"]))
+        await started_evt.wait()
+        gen_store.clear()
+        release_evt.set()
+        with pytest.raises(jwt.InvalidKeyError, match="Failed to fetch JWKS"):
+            await task_err
+        assert gen_store._last_error_at is None
+        assert gen_store._last_error_url is None
+
+
+@pytest.mark.asyncio
+async def test_mr_john_auth_client_direct_and_admin_methods():
+    """Verify MrJohnAuthClient v2.0 Direct REST API, Admin API, and context manager lifecycle."""
+    mock_client = AsyncMock()
+    mock_client.post.return_value = MagicMock(
+        status_code=200,
+        content=b'{"ok":true}',
+        raise_for_status=lambda: None,
+        json=lambda: {"ok": True},
+    )
+    mock_client.get.return_value = MagicMock(
+        status_code=200,
+        content=b'{"users":[]}',
+        raise_for_status=lambda: None,
+        json=lambda: {"users": []},
+    )
+    mock_client.patch.return_value = MagicMock(
+        status_code=200,
+        content=b'{"id":"u1"}',
+        raise_for_status=lambda: None,
+        json=lambda: {"id": "u1"},
+    )
+    mock_client.delete.return_value = MagicMock(
+        status_code=200,
+        content=b'{"message":"deleted"}',
+        raise_for_status=lambda: None,
+        json=lambda: {"message": "deleted"},
+    )
+
+    async with MrJohnAuthClient(
+        api_base_url="https://auth.api.mr-john-it.com",
+        admin_access_token="admin-jwt",
+        http_client=mock_client,
+    ) as sdk_client:
+        assert await sdk_client.login("u@example.com", "pw") == {"ok": True}
+        assert await sdk_client.verify_mfa("mfa-t", "123456") == {"ok": True}
+        assert await sdk_client.refresh_tokens("rt") == {"ok": True}
+        assert await sdk_client.logout("rt") == {"ok": True}
+        assert await sdk_client.get_user_profile("user-jwt") == {"users": []}
+        assert await sdk_client.list_users(q="a", role="user", is_active=True) == {"users": []}
+        assert await sdk_client.get_user("u1") == {"users": []}
+        assert await sdk_client.update_user(
+            "u1",
+            display_name="Updated",
+            global_role="admin",
+            is_active=True,
+            custom_claims={"pro": True},
+        ) == {"id": "u1"}
+        assert await sdk_client.revoke_user_sessions("u1") == {"ok": True}
+        assert await sdk_client.delete_user("u1") == {"message": "deleted"}
+
+    # Test internally managed AsyncClient lifecycle (__aenter__ / __aexit__ / aclose)
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = MagicMock(
+            status_code=200,
+            content=b'{"access_token":"at_1"}',
+            raise_for_status=lambda: None,
+            json=lambda: {"access_token": "at_1"},
+        )
+        async with MrJohnAuthClient(api_base_url="https://auth.api.mr-john-it.com") as pooled_client:
+            res = await pooled_client.login("u@example.com", "pw")
+            assert res["access_token"] == "at_1"
+            # Re-entering when _http_client is already set
             async with pooled_client as same_client:
                 assert same_client is pooled_client
 
@@ -508,67 +959,184 @@ async def test_mr_john_auth_client_methods():
 
 
 @pytest.mark.asyncio
-async def test_sdk_configure_env_resolution_and_stale_while_revalidate(rsa_key_pair, monkeypatch):
-    """Verify programmatic configure(), dynamic env resolution, and Stale-While-Revalidate JWKS fallback."""
-    # 1. Test default fallback resolution when globals match defaults
-    monkeypatch.setenv("MR_JOHN_AUTH_API_URL", "https://env-api.mr-john.dev")
-    monkeypatch.setenv("MR_JOHN_AUTH_ISSUER", "https://env-issuer.mr-john.dev")
-    monkeypatch.setenv("MR_JOHN_CLIENT_ID", "env-client")
-    monkeypatch.setenv("MR_JOHN_CLIENT_SECRET", "env-secret")
-    monkeypatch.delenv("MR_JOHN_AUTH_JWKS_URL", raising=False)
-
-    auth_guard.AUTH_API_URL = auth_guard._DEFAULT_AUTH_API_URL
-    auth_guard.AUTH_JWKS_URL = f"{auth_guard._DEFAULT_AUTH_API_URL}/.well-known/jwks.json"
-    auth_guard.AUTH_ISSUER = auth_guard._DEFAULT_AUTH_ISSUER
-    auth_guard.SERVICE_CLIENT_ID = auth_guard._DEFAULT_CLIENT_ID
-    auth_guard.SERVICE_CLIENT_SECRET = ""
-
-    assert auth_guard._resolve_api_url() == "https://env-api.mr-john.dev"
-    assert auth_guard._resolve_jwks_url() == "https://env-api.mr-john.dev/.well-known/jwks.json"
-    assert auth_guard._resolve_issuer() == "https://env-issuer.mr-john.dev"
-    assert auth_guard._resolve_client_id() == "env-client"
-    assert auth_guard._resolve_client_secret() == "env-secret"
-
-    monkeypatch.setenv("MR_JOHN_AUTH_JWKS_URL", "https://env-jwks.mr-john.dev/jwks.json")
-    assert auth_guard._resolve_jwks_url() == "https://env-jwks.mr-john.dev/jwks.json"
-
-    # 2. Test programmatic configure()
-    auth_guard.configure(
-        client_id="configured-service",
-        client_secret="mjc_cfg_secret",
-        api_url="https://custom-auth.mr-john.dev",
-        issuer="https://custom-portal.mr-john.dev",
+async def test_sdk_client_prevents_confused_deputy_and_header_injection():
+    """Verify get_user_profile and _build_headers never fall back to admin/service credentials on invalid tokens."""
+    mock_client = AsyncMock()
+    mock_client.get.return_value = MagicMock(
+        status_code=200,
+        content=b'{"id":"user-1"}',
+        raise_for_status=lambda: None,
+        json=lambda: {"id": "user-1"},
     )
-    assert auth_guard._resolve_client_id() == "configured-service"
-    assert auth_guard._resolve_client_secret() == "mjc_cfg_secret"
-    assert auth_guard._resolve_api_url() == "https://custom-auth.mr-john.dev"
-    assert auth_guard._resolve_jwks_url() == "https://custom-auth.mr-john.dev/.well-known/jwks.json"
-    assert auth_guard._resolve_issuer() == "https://custom-portal.mr-john.dev"
 
-    auth_guard.configure(jwks_url="https://custom-jwks.mr-john.dev/keys.json")
-    assert auth_guard._resolve_jwks_url() == "https://custom-jwks.mr-john.dev/keys.json"
+    async with MrJohnAuthClient(
+        api_base_url="https://auth.api.mr-john-it.com",
+        client_id="c",
+        client_secret="s",
+        admin_access_token="admin-jwt",
+        http_client=mock_client,
+    ) as sdk_client:
+        invalid_tokens = [
+            "",
+            "   ",
+            None,
+            "tok\r\nX: 1",
+            "tok bar",
+            "tok\x00null",
+            "tok\x85c1",
+            123,
+        ]
+        for bad_token in invalid_tokens:
+            with pytest.raises(ValueError):
+                await sdk_client.get_user_profile(bad_token)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                sdk_client._build_headers(bad_token)
+        assert mock_client.get.call_count == 0
 
-    # 3. Test Stale-While-Revalidate on AsyncJWKSStore
-    store = AsyncJWKSStore(cache_ttl=10, min_refetch_cooldown=0)
-    kid = rsa_key_pair["kid"]
+        # Valid user token binds strictly to that user token without leaking service headers.
+        profile = await sdk_client.get_user_profile("user-jwt")
+        assert profile == {"id": "user-1"}
+        assert mock_client.get.call_count == 1
+        call_headers = mock_client.get.call_args.kwargs["headers"]
+        assert call_headers == {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer user-jwt",
+        }
+        assert "X-Client-Id" not in call_headers
+        assert "X-Client-Secret" not in call_headers
 
-    mock_resp = MagicMock()
-    mock_resp.json.return_value = {"keys": [rsa_key_pair["jwk"]]}
-    mock_resp.raise_for_status = MagicMock()
+        # Omitting access_token still uses admin/service credentials for admin endpoints.
+        assert sdk_client._build_headers() == {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer admin-jwt",
+        }
 
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
-        mock_get.return_value = mock_resp
-        key1 = await store.get_signing_key(kid)
-        assert key1 is not None
+    # Service client credentials still apply when admin_access_token is unset and access_token is omitted,
+    # while get_user_profile() still rejects invalid user tokens without falling back to X-Client-Id/Secret.
+    async with MrJohnAuthClient(
+        api_base_url="https://auth.api.mr-john-it.com",
+        client_id="c",
+        client_secret="s",
+        admin_access_token=None,
+        http_client=mock_client,
+    ) as svc_client:
+        assert svc_client._build_headers() == {
+            "Content-Type": "application/json",
+            "X-Client-Id": "c",
+            "X-Client-Secret": "s",
+        }
+        with pytest.raises(ValueError):
+            await svc_client.get_user_profile("")
+        assert mock_client.get.call_count == 1
 
-        # Expire cache TTL and simulate network failure -> should serve stale key
-        store._last_fetched_at -= 20
-        mock_get.side_effect = Exception("Temporary DNS error")
-        key_stale = await store.get_signing_key(kid)
-        assert key_stale == key1
 
-        # Clear cache -> network failure now raises InvalidKeyError
-        store.clear()
-        with pytest.raises(jwt.InvalidKeyError, match="Failed to fetch JWKS"):
-            await store.get_signing_key(kid)
+@pytest.mark.asyncio
+async def test_sdk_client_validates_admin_user_id_before_http_requests():
+    """Verify admin user methods reject path traversal/injection user_ids before HTTP calls while allowing non-UUID IDs."""
+    mock_client = AsyncMock()
+    ok_resp = MagicMock(
+        status_code=200,
+        content=b'{"ok":true}',
+        raise_for_status=lambda: None,
+        json=lambda: {"ok": True},
+    )
+    mock_client.get.return_value = ok_resp
+    mock_client.patch.return_value = ok_resp
+    mock_client.post.return_value = ok_resp
+    mock_client.delete.return_value = ok_resp
+
+    async with MrJohnAuthClient(
+        api_base_url="https://auth.api.mr-john-it.com",
+        admin_access_token="admin-jwt",
+        http_client=mock_client,
+    ) as sdk_client:
+        invalid_user_ids = [
+            "",
+            ".",
+            "..",
+            "../users/me",
+            "a/b",
+            "a\\b",
+            "u1?a=1",
+            "u1#f",
+            "u1%2e",
+            " u1",
+            "u1\n",
+            "u1\x00",
+            "u1\x7f",
+            "u1\x85",
+            "a" * 65,
+            123,
+        ]
+        for bad_id in invalid_user_ids:
+            with pytest.raises(ValueError):
+                await sdk_client.get_user(bad_id)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                await sdk_client.update_user(bad_id, display_name="X")  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                await sdk_client.revoke_user_sessions(bad_id)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                await sdk_client.delete_user(bad_id)  # type: ignore[arg-type]
+
+        assert mock_client.get.call_count == 0
+        assert mock_client.patch.call_count == 0
+        assert mock_client.post.call_count == 0
+        assert mock_client.delete.call_count == 0
+
+        # Non-UUID test IDs, single-dot IDs, max-length 64 IDs, and UUIDs are all permitted.
+        valid_ids = [
+            "u1",
+            "user.1",
+            "a" * 64,
+            "550e8400-e29b-41d4-a716-446655440000",
+        ]
+        for valid_id in valid_ids:
+            assert await sdk_client.get_user(valid_id) == {"ok": True}
+            assert await sdk_client.update_user(valid_id, display_name="Valid") == {"ok": True}
+            assert await sdk_client.revoke_user_sessions(valid_id) == {"ok": True}
+            assert await sdk_client.delete_user(valid_id) == {"ok": True}
+
+        assert mock_client.get.call_count == len(valid_ids)
+        assert mock_client.patch.call_count == len(valid_ids)
+        assert mock_client.post.call_count == len(valid_ids)
+        assert mock_client.delete.call_count == len(valid_ids)
+
+
+@pytest.mark.asyncio
+async def test_auth_user_claim_fallbacks_and_oneshot_client():
+    """Verify AuthUser custom_claims fallbacks (plan_tier, bool tier, singular role) and one-shot HTTP client."""
+    # Scoped custom_claims dict with plan_tier and singular role
+    scoped_user = AuthUser(
+        id="u-scoped",
+        email="s@example.com",
+        custom_claims={"svc-a": {"plan_tier": "starter", "role": "reviewer"}},
+    )
+    assert scoped_user.get_service_plan("svc-a") == "starter"
+    assert scoped_user.get_service_roles("svc-a") == ["reviewer"]
+
+    # Boolean tier flag in custom_claims (e.g. {"pro": True}) and fallback to "free"
+    bool_tier_user = AuthUser(id="u-bool", email="b@example.com", custom_claims={"pro": True})
+    assert bool_tier_user.get_service_plan("svc-b") == "pro"
+    assert bool_tier_user.get_service_roles("svc-b") == []
+
+    no_tier_user = AuthUser(id="u-none", email="n@example.com", custom_claims={"other": 1})
+    assert no_tier_user.get_service_plan("svc-c") == "free"
+
+    empty_user = AuthUser(id="u-empty", email="e@example.com")
+    assert empty_user.get_service_plan("svc-d") == "free"
+    assert empty_user.get_service_roles("svc-d") == []
+
+    admin_user = AuthUser(id="u-admin", email="a@example.com", global_role="admin")
+    assert admin_user.has_minimum_plan("enterprise") is True
+
+    # One-shot MrJohnAuthClient request (without async with) + 204 No Content decoding
+    oneshot_client = MrJohnAuthClient(api_base_url="https://auth.api.mr-john-it.com")
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = MagicMock(
+            status_code=204,
+            content=b"",
+            raise_for_status=lambda: None,
+        )
+        res = await oneshot_client.logout("rt-1")
+        assert res == {}
 
